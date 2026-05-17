@@ -2,7 +2,7 @@
 #![no_main]
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use cortex_m::interrupt::Mutex;
 use cortex_m_rt::entry;
@@ -10,7 +10,7 @@ use panic_halt as _;
 
 use stm32h7xx_hal::{
     delay::Delay,
-    gpio::{gpioe::PE3, Output, PushPull},
+    gpio::{gpioc::PC13, gpioe::PE3, Edge, ExtiPin, Input, Output, PushPull},
     pac::{self, interrupt, TIM2},
     prelude::*,
     rtc::{self, RtcClock},
@@ -28,27 +28,63 @@ use embedded_graphics::{
 };
 use st7735_lcd::{Orientation, ST7735};
 
-// WeAct STM32H743VIT6 Mini — onboard 0.96" 80x160 ST7735:
-//   SPI4: SCK = PE12, MOSI = PE14
-//   LCD_CS    = PE11
-//   LCD_DC    = PE13
-//   LCD_BL    = PE10 (active-low via P-MOSFET)
-//   LCD_RESET = tied to system NRST
-//   LED       = PE3 (active-low)
+// WeAct STM32H743VIT6 Mini pinout:
+//   SPI4: SCK=PE12, MOSI=PE14   LCD_CS=PE11   LCD_DC=PE13
+//   LCD_BL=PE10 (active-low via P-MOSFET)     LCD_RESET tied to NRST
+//   LED=PE3 (active-high via NPN)             K1=PC13 (active-high)
 
-const TICK_HZ: u32 = 10; // TIM2 fires every 100 ms
-const LED_PERIOD_TICKS: u32 = 50; // 50 * 100 ms = 5 s between pulses
-                                  // pulse width = 1 tick = 100 ms
+const TICK_HZ: u32 = 10;
 
-// Shared between main loop and ISR
+#[repr(u8)]
+#[derive(Clone, Copy)]
+enum Mode {
+    Off = 0,
+    Fast = 1,
+    Slow = 2,
+    Solid = 3,
+}
+
+impl Mode {
+    fn next(self) -> Mode {
+        match self {
+            Mode::Off => Mode::Fast,
+            Mode::Fast => Mode::Slow,
+            Mode::Slow => Mode::Solid,
+            Mode::Solid => Mode::Off,
+        }
+    }
+    fn from_u8(v: u8) -> Mode {
+        match v & 0b11 {
+            0 => Mode::Off,
+            1 => Mode::Fast,
+            2 => Mode::Slow,
+            _ => Mode::Solid,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Mode::Off => "OFF  ",
+            Mode::Fast => "FAST ",
+            Mode::Slow => "SLOW ",
+            Mode::Solid => "SOLID",
+        }
+    }
+}
+
+// Shared state between main and ISRs.
 static TICKS: AtomicU32 = AtomicU32::new(0);
+static MODE: AtomicU8 = AtomicU8::new(Mode::Off as u8);
+// Next tick at which a button press is allowed (debounce lockout).
+static DEBOUNCE_UNTIL: AtomicU32 = AtomicU32::new(0);
+
 static G_TIM2: Mutex<RefCell<Option<Timer<TIM2>>>> = Mutex::new(RefCell::new(None));
 static G_LED: Mutex<RefCell<Option<PE3<Output<PushPull>>>>> = Mutex::new(RefCell::new(None));
+static G_BTN: Mutex<RefCell<Option<PC13<Input>>>> = Mutex::new(RefCell::new(None));
 
 #[entry]
 fn main() -> ! {
     let cp = cortex_m::Peripherals::take().unwrap();
-    let dp = pac::Peripherals::take().unwrap();
+    let mut dp = pac::Peripherals::take().unwrap();
 
     let pwr = dp.PWR.constrain();
     let mut pwrcfg = pwr.freeze();
@@ -59,24 +95,31 @@ fn main() -> ! {
 
     let mut delay = Delay::new(cp.SYST, ccdr.clocks);
 
+    let gpioc = dp.GPIOC.split(ccdr.peripheral.GPIOC);
     let gpioe = dp.GPIOE.split(ccdr.peripheral.GPIOE);
 
-    // LED PE3 (active-high via NPN Q2) — start off
     let mut led = gpioe.pe3.into_push_pull_output();
     led.set_low();
 
-    // Backlight PE10 — active-low: LOW = ON
+    let mut btn = gpioc.pc13.into_pull_down_input();
+    let mut syscfg = dp.SYSCFG;
+    btn.make_interrupt_source(&mut syscfg);
+    btn.trigger_on_edge(&mut dp.EXTI, Edge::Rising);
+    btn.enable_interrupt(&mut dp.EXTI);
+
+    // Backlight on (active-low through P-MOSFET).
     let mut bl = gpioe.pe10.into_push_pull_output();
     bl.set_low();
 
-    // CS PE11 — hold LOW (single-device SPI)
-    let mut cs = gpioe.pe11.into_push_pull_output();
-    cs.set_low();
+    // Single device on SPI4: drive CS low for the entire session.
+    let mut cs_pin = gpioe.pe11.into_push_pull_output();
+    cs_pin.set_low();
 
     let dc = gpioe.pe13.into_push_pull_output();
+    // No physical LCD reset line (panel resets with NRST). Driver still needs
+    // an OutputPin, so we hand it an unused GPIO.
     let rst = gpioe.pe15.into_push_pull_output();
 
-    // SPI4: SCK=PE12, MOSI=PE14 (AF5)
     let sck = gpioe.pe12.into_alternate::<5>();
     let mosi = gpioe.pe14.into_alternate::<5>();
     let spi = dp.SPI4.spi(
@@ -95,16 +138,10 @@ fn main() -> ! {
     display.set_offset(0, 24);
     display.clear(Rgb565::BLACK).unwrap();
 
-    // RTC on LSI.
-    // Time is kept in the backup domain across resets/power-off as long as
-    // VBAT is held up (CR2032 on the VBAT pad). Backup register 0 stores a
-    // magic value; if it's missing we treat this as a cold boot and seed the
-    // clock with the build-time default (Asia/Yekaterinburg, UTC+5).
+    // Seed RTC only on cold boot. Bump RTC_MAGIC to force a re-seed.
     const RTC_MAGIC: u32 = 0xCAFE_0035;
     let mut rtc = rtc::Rtc::open_or_init(dp.RTC, backup.RTC, RtcClock::Lsi, &ccdr.clocks);
     if rtc.read_backup_reg(0) != RTC_MAGIC {
-        // Cold boot — seed with current Asia/Yekaterinburg wall-clock time.
-        // Stored as LOCAL time (the RTC is wall-clock; no timezone awareness).
         rtc.set_date_time(
             NaiveDate::from_ymd_opt(2026, 5, 18)
                 .unwrap()
@@ -114,33 +151,39 @@ fn main() -> ! {
         rtc.write_backup_reg(0, RTC_MAGIC);
     }
 
-    // TIM2 — 100 ms periodic interrupt
     let mut tim2 = dp
         .TIM2
         .timer(TICK_HZ.Hz(), ccdr.peripheral.TIM2, &ccdr.clocks);
     tim2.listen(Event::TimeOut);
 
-    // Move LED + timer into globals so the ISR can reach them
     cortex_m::interrupt::free(|cs| {
         G_LED.borrow(cs).replace(Some(led));
         G_TIM2.borrow(cs).replace(Some(tim2));
+        G_BTN.borrow(cs).replace(Some(btn));
     });
-    unsafe { pac::NVIC::unmask(interrupt::TIM2) };
+    unsafe {
+        pac::NVIC::unmask(interrupt::TIM2);
+        pac::NVIC::unmask(interrupt::EXTI15_10);
+    }
 
     let bg = PrimitiveStyle::with_fill(Rgb565::BLACK);
     let time_style = MonoTextStyle::new(&FONT_10X20, Rgb565::CYAN);
     let date_style = MonoTextStyle::new(&FONT_10X20, Rgb565::CSS_LIGHT_SKY_BLUE);
+    let mode_style = MonoTextStyle::new(&FONT_10X20, Rgb565::YELLOW);
 
     let mut tbuf = [0u8; 8];
     let mut dbuf = [0u8; 10];
     let mut last_drawn_tick = u32::MAX;
+    let mut last_drawn_mode = u8::MAX;
 
     loop {
         let tick = TICKS.load(Ordering::Relaxed);
+        let mode_raw = MODE.load(Ordering::Relaxed);
 
-        // Redraw the screen at most once per tick (every 100 ms)
-        if tick != last_drawn_tick {
+        // Redraw only when something changed; sleep on wfi() otherwise.
+        if tick != last_drawn_tick || mode_raw != last_drawn_mode {
             last_drawn_tick = tick;
+            last_drawn_mode = mode_raw;
 
             if let Some(dt) = rtc.date_time() {
                 let h = dt.hour() as u8;
@@ -150,26 +193,39 @@ fn main() -> ! {
                 let mo = dt.month() as u8;
                 let y = dt.year();
 
-                Rectangle::new(Point::new(0, 14), Size::new(160, 24))
+                Rectangle::new(Point::new(0, 0), Size::new(160, 22))
+                    .into_styled(bg)
+                    .draw(&mut display)
+                    .unwrap();
+                Text::with_alignment(
+                    Mode::from_u8(mode_raw).label(),
+                    Point::new(80, 18),
+                    mode_style,
+                    Alignment::Center,
+                )
+                .draw(&mut display)
+                .unwrap();
+
+                Rectangle::new(Point::new(0, 26), Size::new(160, 22))
                     .into_styled(bg)
                     .draw(&mut display)
                     .unwrap();
                 Text::with_alignment(
                     fmt_time(&mut tbuf, h, m, s),
-                    Point::new(80, 34),
+                    Point::new(80, 44),
                     time_style,
                     Alignment::Center,
                 )
                 .draw(&mut display)
                 .unwrap();
 
-                Rectangle::new(Point::new(0, 42), Size::new(160, 24))
+                Rectangle::new(Point::new(0, 52), Size::new(160, 22))
                     .into_styled(bg)
                     .draw(&mut display)
                     .unwrap();
                 Text::with_alignment(
                     fmt_date(&mut dbuf, d, mo, y),
-                    Point::new(80, 62),
+                    Point::new(80, 70),
                     date_style,
                     Alignment::Center,
                 )
@@ -178,10 +234,11 @@ fn main() -> ! {
             }
         }
 
-        cortex_m::asm::wfi(); // sleep until next interrupt
+        cortex_m::asm::wfi();
     }
 }
 
+// 10 Hz tick: drives the LED pattern.
 #[interrupt]
 fn TIM2() {
     let tick = TICKS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
@@ -191,14 +248,38 @@ fn TIM2() {
             t.clear_irq();
         }
         if let Some(led) = G_LED.borrow(cs).borrow_mut().as_mut() {
-            // Pulse LED for one tick (100 ms) every LED_PERIOD_TICKS (= 5 s).
-            // On WeAct H743 the PE3 LED is driven through an NPN transistor
-            // (Q2 PDTC114E), so the pin is ACTIVE-HIGH: HIGH = on, LOW = off.
-            let phase = tick % LED_PERIOD_TICKS;
-            if phase == 0 {
-                led.set_high(); // ON pulse
-            } else if phase == 1 {
-                led.set_low(); // OFF for the rest of the period
+            match Mode::from_u8(MODE.load(Ordering::Relaxed)) {
+                Mode::Off => led.set_low(),
+                // 100 ms on / 100 ms off — closest to 50 ms at a 10 Hz tick.
+                Mode::Fast => {
+                    if tick & 1 == 0 { led.set_high() } else { led.set_low() }
+                }
+                // 500 ms on / 500 ms off = toggle every 5 ticks.
+                Mode::Slow => {
+                    if (tick / 5) & 1 == 0 { led.set_high() } else { led.set_low() }
+                }
+                Mode::Solid => led.set_high(),
+            }
+        }
+    });
+}
+
+// K1 press → advance MODE. Debounced via a tick-based lockout.
+#[interrupt]
+fn EXTI15_10() {
+    cortex_m::interrupt::free(|cs| {
+        if let Some(b) = G_BTN.borrow(cs).borrow_mut().as_mut() {
+            if b.check_interrupt() {
+                b.clear_interrupt_pending_bit();
+
+                let now = TICKS.load(Ordering::Relaxed);
+                let until = DEBOUNCE_UNTIL.load(Ordering::Relaxed);
+                // Wrapping-aware "now >= until" check.
+                if now.wrapping_sub(until) < u32::MAX / 2 {
+                    let cur = Mode::from_u8(MODE.load(Ordering::Relaxed));
+                    MODE.store(cur.next() as u8, Ordering::Relaxed);
+                    DEBOUNCE_UNTIL.store(now.wrapping_add(3), Ordering::Relaxed);
+                }
             }
         }
     });
