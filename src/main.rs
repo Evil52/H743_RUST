@@ -61,9 +61,9 @@ fn main() -> ! {
 
     let gpioe = dp.GPIOE.split(ccdr.peripheral.GPIOE);
 
-    // LED PE3 (active-low) — start off
+    // LED PE3 (active-high via NPN Q2) — start off
     let mut led = gpioe.pe3.into_push_pull_output();
-    led.set_high();
+    led.set_low();
 
     // Backlight PE10 — active-low: LOW = ON
     let mut bl = gpioe.pe10.into_push_pull_output();
@@ -191,12 +191,14 @@ fn TIM2() {
             t.clear_irq();
         }
         if let Some(led) = G_LED.borrow(cs).borrow_mut().as_mut() {
-            // Pulse LED for one tick (100 ms) every LED_PERIOD_TICKS (= 5 s)
+            // Pulse LED for one tick (100 ms) every LED_PERIOD_TICKS (= 5 s).
+            // On WeAct H743 the PE3 LED is driven through an NPN transistor
+            // (Q2 PDTC114E), so the pin is ACTIVE-HIGH: HIGH = on, LOW = off.
             let phase = tick % LED_PERIOD_TICKS;
             if phase == 0 {
-                led.set_low(); // PE3 is active-low → ON
+                led.set_high(); // ON pulse
             } else if phase == 1 {
-                led.set_high(); // OFF
+                led.set_low(); // OFF for the rest of the period
             }
         }
     });
