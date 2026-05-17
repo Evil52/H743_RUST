@@ -9,6 +9,9 @@
 
 
 <img width="12288" height="16320" alt="743 (1)" src="https://github.com/user-attachments/assets/96e06c38-b271-4ac7-a001-33cfff09cdeb" />
+
+*[English version](README.en.md)*
+
 # weact-h743 — RTC-часы с управляемым LED на STM32H743
 
 Прошивка для отладочной платы **WeAct Studio MiniSTM32H7xx** (STM32H743VIT6),
