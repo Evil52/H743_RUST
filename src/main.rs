@@ -34,9 +34,16 @@ use st7735_lcd::{Orientation, ST7735};
 //   LED=PE3 (active-high via NPN)             K1=PC13 (active-high)
 
 const TICK_HZ: u32 = 10;
+// 500 ms half-period for SLOW blink at a 10 Hz tick.
+const SLOW_HALF_TICKS: u32 = TICK_HZ / 2;
+// Debounce lockout for the K1 button (~300 ms).
+const DEBOUNCE_TICKS: u32 = 3;
+// Bump this whenever you change the seeded date/time below — a mismatch with
+// the value stored in backup register 0 forces a re-seed on next boot.
+const RTC_MAGIC: u32 = 0xCAFE_0036;
 
 #[repr(u8)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Off = 0,
     Fast = 1,
@@ -138,9 +145,18 @@ fn main() -> ! {
     display.set_offset(0, 24);
     display.clear(Rgb565::BLACK).unwrap();
 
-    // Seed RTC only on cold boot. Bump RTC_MAGIC to force a re-seed.
-    const RTC_MAGIC: u32 = 0xCAFE_0035;
-    let mut rtc = rtc::Rtc::open_or_init(dp.RTC, backup.RTC, RtcClock::Lsi, &ccdr.clocks);
+    // RTC on LSE (32.768 kHz crystal X2 on the WeAct board — ±20 ppm,
+    // seconds-per-day accuracy vs. minutes/day on LSI).
+    let mut rtc = rtc::Rtc::open_or_init(
+        dp.RTC,
+        backup.RTC,
+        RtcClock::Lse {
+            freq: 32_768.Hz(),
+            bypass: false,
+            css: false,
+        },
+        &ccdr.clocks,
+    );
     if rtc.read_backup_reg(0) != RTC_MAGIC {
         rtc.set_date_time(
             NaiveDate::from_ymd_opt(2026, 5, 18)
@@ -183,39 +199,37 @@ fn main() -> ! {
 
     let mut tbuf = [0u8; 8];
     let mut dbuf = [0u8; 10];
-    let mut last_drawn_tick = u32::MAX;
-    let mut last_drawn_mode = u8::MAX;
+    // Track what is currently shown so we only redraw on real change.
+    let mut last_second: Option<u8> = None;
+    let mut last_day: Option<u8> = None;
+    let mut last_mode: Option<Mode> = None;
 
     loop {
-        let tick = TICKS.load(Ordering::Relaxed);
-        let mode_raw = MODE.load(Ordering::Relaxed);
+        let mode = Mode::from_u8(MODE.load(Ordering::Relaxed));
 
-        // Redraw only when something changed; sleep on wfi() otherwise.
-        if tick != last_drawn_tick || mode_raw != last_drawn_mode {
-            last_drawn_tick = tick;
-            last_drawn_mode = mode_raw;
+        if let Some(dt) = rtc.date_time() {
+            let s = dt.second() as u8;
+            let d = dt.day() as u8;
 
-            if let Some(dt) = rtc.date_time() {
-                let h = dt.hour() as u8;
-                let m = dt.minute() as u8;
-                let s = dt.second() as u8;
-                let d = dt.day() as u8;
-                let mo = dt.month() as u8;
-                let y = dt.year();
-
+            if last_mode != Some(mode) {
                 Rectangle::new(Point::new(0, 0), Size::new(160, 22))
                     .into_styled(bg)
                     .draw(&mut display)
                     .unwrap();
                 Text::with_alignment(
-                    Mode::from_u8(mode_raw).label(),
+                    mode.label(),
                     Point::new(80, 18),
                     mode_style,
                     Alignment::Center,
                 )
                 .draw(&mut display)
                 .unwrap();
+                last_mode = Some(mode);
+            }
 
+            if last_second != Some(s) {
+                let h = dt.hour() as u8;
+                let m = dt.minute() as u8;
                 Rectangle::new(Point::new(0, 26), Size::new(160, 22))
                     .into_styled(bg)
                     .draw(&mut display)
@@ -228,7 +242,12 @@ fn main() -> ! {
                 )
                 .draw(&mut display)
                 .unwrap();
+                last_second = Some(s);
+            }
 
+            if last_day != Some(d) {
+                let mo = dt.month() as u8;
+                let y = dt.year();
                 Rectangle::new(Point::new(0, 52), Size::new(160, 22))
                     .into_styled(bg)
                     .draw(&mut display)
@@ -241,6 +260,7 @@ fn main() -> ! {
                 )
                 .draw(&mut display)
                 .unwrap();
+                last_day = Some(d);
             }
         }
 
@@ -264,9 +284,13 @@ fn TIM2() {
                 Mode::Fast => {
                     if tick & 1 == 0 { led.set_high() } else { led.set_low() }
                 }
-                // 500 ms on / 500 ms off = toggle every 5 ticks.
+                // 500 ms on / 500 ms off — toggle every SLOW_HALF_TICKS ticks.
                 Mode::Slow => {
-                    if (tick / 5) & 1 == 0 { led.set_high() } else { led.set_low() }
+                    if (tick / SLOW_HALF_TICKS) & 1 == 0 {
+                        led.set_high()
+                    } else {
+                        led.set_low()
+                    }
                 }
                 Mode::Solid => led.set_high(),
             }
@@ -288,7 +312,7 @@ fn EXTI15_10() {
                 if now.wrapping_sub(until) < u32::MAX / 2 {
                     let cur = Mode::from_u8(MODE.load(Ordering::Relaxed));
                     MODE.store(cur.next() as u8, Ordering::Relaxed);
-                    DEBOUNCE_UNTIL.store(now.wrapping_add(3), Ordering::Relaxed);
+                    DEBOUNCE_UNTIL.store(now.wrapping_add(DEBOUNCE_TICKS), Ordering::Relaxed);
                 }
             }
         }
