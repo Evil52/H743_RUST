@@ -161,6 +161,16 @@ fn main() -> ! {
         G_TIM2.borrow(cs).replace(Some(tim2));
         G_BTN.borrow(cs).replace(Some(btn));
     });
+    // SAFETY: `NVIC::unmask` is `unsafe` because enabling an IRQ before its
+    // handler is ready to run (peripheral configured, shared state published)
+    // can break mask-based critical sections elsewhere in the program. Here
+    // both invariants are satisfied:
+    //   1. TIM2 and PC13/EXTI are fully configured above.
+    //   2. The globals G_LED, G_TIM2, G_BTN have already been populated
+    //      inside the `interrupt::free` block right above this call, so the
+    //      first time TIM2/EXTI15_10 fires the ISRs see initialized state.
+    // There is no safe API in stm32h7xx-hal to enable an NVIC line, so this
+    // is the only way to arm the interrupts.
     unsafe {
         pac::NVIC::unmask(interrupt::TIM2);
         pac::NVIC::unmask(interrupt::EXTI15_10);

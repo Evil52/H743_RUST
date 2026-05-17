@@ -98,6 +98,64 @@ Rationale:
 
 ---
 
+## 2.1. About the single `unsafe` block in the firmware
+
+The project contains **exactly one** `unsafe` block — enabling the NVIC
+interrupt lines:
+
+```rust
+unsafe {
+    pac::NVIC::unmask(interrupt::TIM2);
+    pac::NVIC::unmask(interrupt::EXTI15_10);
+}
+```
+
+**Why the API itself is `unsafe`:**
+`cortex-m` marks `NVIC::unmask` as `unsafe` because enabling an interrupt
+can break critical sections built on the "mask this specific interrupt"
+pattern instead of `interrupt::free`. If some other piece of code is
+relying on the fact that TIM2 won't fire — our `unmask` invalidates that
+assumption.
+
+**Why it is safe in this firmware:**
+
+1. **The peripherals are already configured** by the time we call
+   `unmask`. TIM2 is started and `listen` has subscribed it to
+   `TimeOut`. PC13 is configured as a pull-down input and registered as
+   an EXTI source on rising edges.
+
+2. **The global resources are already published** to `G_LED`, `G_TIM2`,
+   `G_BTN` inside the `interrupt::free` block on the line above. By the
+   time the ISRs first run, those `Option`s are already `Some(...)`.
+
+3. **We do NOT use mask-based critical sections** anywhere else. All
+   critical sections go through `cortex_m::interrupt::free`, which
+   disables interrupts globally for their duration — our `unmask` does
+   not interfere with that.
+
+**Why there is no alternative:**
+
+In `cortex-m` 0.7 `NVIC::unmask` has no safe counterpart. The crate
+authors deliberately require the caller to promise that enabling the
+interrupt won't violate program invariants. The compiler cannot check
+this statically — it has no way to know that we have initialised the
+peripheral and published the shared state.
+
+**What we get out of it:**
+
+- One small, localised `unsafe` block with an explicit `// SAFETY:`
+  comment in the source.
+- Everything else (including the ISR handlers, shared-state access, and
+  device drivers) is 100% safe Rust.
+- In code review, only **one site** has to be checked for soundness of
+  the unsafe invariant — instead of auditing the whole codebase, like
+  you'd have to do in C.
+
+That is the basic Rust principle in action: **`unsafe` is minimised and
+encapsulated, not sprinkled across the program.**
+
+---
+
 ## 3. Tech stack
 
 ### 3.0. Execution model: bare-metal + ISRs (NOT async / NOT Embassy)
