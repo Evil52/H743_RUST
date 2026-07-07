@@ -6,11 +6,11 @@ edition = "2021"
 [dependencies]
 cortex-m     = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt  = "0.7"
-panic-halt   = "0.2"
+panic-halt   = "1.0.0"
 stm32h7xx-hal    = { version = "0.16", features = ["stm32h743v", "rt", "rtc"] }
-st7735-lcd       = "0.9"
+st7735-lcd       = "0.10.0"
 embedded-graphics = "0.8"
-chrono           = { version = "0.4", default-features = false }
+chrono           = { version = "0.4.45", default-features = false }
 
 [profile.release]
 opt-level   = "s"

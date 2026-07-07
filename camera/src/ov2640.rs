@@ -23,6 +23,7 @@ const BANK_SENSOR: u8 = 0x01;
 // Sensor bank registers used outside the tables.
 const REG_COM7: u8 = 0x12;
 const COM7_SRST: u8 = 0x80;
+#[allow(dead_code)] // used by set_colorbar (bring-up helper)
 const COM7_COLOR_BAR: u8 = 0x02;
 const REG_PID: u8 = 0x0A;
 const REG_VER: u8 = 0x0B;
@@ -308,7 +309,11 @@ impl<I2C: I2c> Ov2640<I2C> {
     /// downscales it by a power of two, exactly like OpenMV's
     /// `set_framesize`, so any aspect ratio works.
     pub async fn set_output_size(&mut self, width: u16, height: u16) -> Result<(), Error<I2C::Error>> {
-        if width % 4 != 0 || height % 4 != 0 || width > SENSOR_WIDTH || height > SENSOR_HEIGHT {
+        if !width.is_multiple_of(4)
+            || !height.is_multiple_of(4)
+            || width > SENSOR_WIDTH
+            || height > SENSOR_HEIGHT
+        {
             return Err(Error::UnsupportedSize { width, height });
         }
 
@@ -317,7 +322,7 @@ impl<I2C: I2c> Ov2640<I2C> {
         // Largest power-of-two divider (max 8) that still leaves a
         // window no larger than the sensor.
         let max_div = (SENSOR_WIDTH / width).min(SENSOR_HEIGHT / height);
-        let log_div = (15 - (max_div as u16).leading_zeros() as u16).min(3);
+        let log_div = (15 - max_div.leading_zeros() as u16).min(3);
         let div = 1u16 << log_div;
         let w_win = width * div;
         let h_win = height * div;
@@ -351,6 +356,8 @@ impl<I2C: I2c> Ov2640<I2C> {
 
     /// Enable/disable the sensor's built-in color-bar test pattern.
     /// Invaluable for bring-up: rules out optics, exposure and focus.
+    /// Not wired to anything by default — see the commented call in main.
+    #[allow(dead_code)]
     pub async fn set_colorbar(&mut self, enable: bool) -> Result<(), Error<I2C::Error>> {
         self.write(BANK_SEL, BANK_SENSOR).await?;
         let com7 = self.read(REG_COM7).await?;
