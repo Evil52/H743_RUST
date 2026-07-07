@@ -1,0 +1,2 @@
+cargo:rustc-link-search=/Users/user/Documents/Proj/Rust/H743_RUST/camera/target/thumbv7em-none-eabihf/release/build/weact-h743-camera-22a1af03a75ca708/out
+cargo:rerun-if-changed=memory.x

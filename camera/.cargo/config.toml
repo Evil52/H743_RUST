@@ -1,0 +1,17 @@
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+# `cargo run` flashes and streams defmt logs over RTT (needs an ST-Link/probe).
+runner = "probe-rs run --chip STM32H743VITx"
+# NB: the repo-level .cargo/config.toml already injects "-Tlink.x";
+# cargo concatenates rustflags arrays, so it must not be repeated here.
+rustflags = [
+    "-C", "link-arg=--nmagic",
+    "-C", "link-arg=-Tdefmt.x",
+]
+
+[env]
+DEFMT_LOG = "info"
+# Embassy allocates task futures from this arena; two frame-sized tasks fit easily.
+EMBASSY_EXECUTOR_TASK_ARENA_SIZE = "16384"
